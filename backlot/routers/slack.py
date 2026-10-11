@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import re
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -898,6 +898,12 @@ def _messages_block(request: Request, *, empty_sort_dir_ok: bool):
         return err, None
     if err := _missing_argument(request, "query"):
         return err, None
+    # The number check answers before an unknown `sort_dir` and before an empty `query`, and with
+    # both `count` and `page` unreadable its `messages` carries both lines, `/count` first. Measured
+    # on real: the missing required argument above is the only thing that answers ahead of it.
+    counts, err = _numbers(request, ("count", 20), ("page", 1))
+    if err is not None:
+        return err, None
     if err := _bad_sort_dir(request, empty_ok=empty_sort_dir_ok):
         return err, None
     query = _param(request, "query") or ""
@@ -907,8 +913,8 @@ def _messages_block(request: Request, *, empty_sort_dir_ok: bool):
         return _err("no_query"), None
     terms, container, phrase = _parse_slack_query(query)
     ids = auth.visible_ids(request, caller)  # results are scoped to the caller's ACL
-    count = _int(request, "count", 20)
-    page = max(1, _int(request, "page", 1))
+    count = counts["count"]
+    page = max(1, counts["page"])
     offset = (page - 1) * count
     # Honor Slack's sort: "score" (default) = relevance; "timestamp" = by message time. sort_dir
     # defaults to desc (newest first). Previously Backlot always ranked by relevance regardless.
@@ -976,12 +982,17 @@ async def search_files(request: Request):
         return err
     if err := _missing_argument(request, "query"):
         return err
+    # Same order as search.messages and search.all: the number check answers before an unknown
+    # `sort_dir`. search.files reads `count` alone, so there is no second number to report.
+    counts, err = _numbers(request, ("count", 20))
+    if err is not None:
+        return err
     if err := _bad_sort_dir(request, empty_ok=False):
         return err
     query = _param(request, "query") or ""
     if not query.strip():
         return _err("no_query")
-    count = _int(request, "count", 20)
+    count = counts["count"]
     empty = {
         "total": 0,
         "matches": [],
@@ -1329,9 +1340,88 @@ def _limit(request: Request) -> int:
     return _int(request, "limit", default) or default
 
 
+def _first_raw(request: Request, key: str) -> str | None:
+    """The FIRST value of a query parameter, not the last.
+
+    Starlette's ``QueryParams.get`` returns the last, so `?limit=3&limit=9` was read as 9, where
+    the paged Slack methods take the first and a client that appends to a URL rather than
+    replacing what is in it was served the other page under a 200.
+    """
+    values = request.query_params.getlist(key)
+    if values:
+        return values[0]
+    return _param(request, key)
+
+
 def _int(request: Request, key: str, default: int) -> int:
-    v = _param(request, key)
-    try:
-        return min(int(v), get_settings().max_page_size) if v else default
-    except ValueError:
+    """One numeric parameter, refused the way the real API refuses it.
+
+    Anything ``int()`` cannot read is answered with `invalid_arguments` rather than falling back
+    to the default. The fallback silently served a FULL page (the default page size) for
+    `?limit=abc`, which a client reads as a real 100-item page and pages through the collection
+    differently from the real service, which refuses the request outright.
+
+    The width is a long rather than an int: Slack echoes `2147483648` back, so it is not Java's
+    int, and a value beyond the signed 64-bit range is what the refusal is for.
+    """
+    raw = _first_raw(request, key)
+    if raw is None or raw == "":
         return default
+    try:
+        n = int(raw)
+    except ValueError:
+        raise _invalid_int(key, raw) from None
+    if not -(2**63) <= n <= 2**63 - 1:
+        raise _invalid_int(key, raw)
+    return min(n, get_settings().max_page_size) if key == "limit" else n
+
+
+def _numbers(request: Request, *params: tuple[str, int]) -> tuple[dict[str, int], dict | None]:
+    """Read several numeric parameters at once, and report every unreadable one together.
+
+    A request with two unreadable numbers is answered with both in `response_metadata.messages`
+    rather than only the first: measured on real, `?count=x&page=y` names `/count` and then
+    `/page`, so a client fixing one field at a time is not sent back for the other.
+    """
+    values: dict[str, int] = {}
+    messages: list[str] = []
+    for key, default in params:
+        raw = _first_raw(request, key)
+        if raw is None or raw == "":
+            values[key] = default
+            continue
+        try:
+            n = int(raw)
+        except ValueError:
+            messages.append(_invalid_int_message(key, raw))
+            values[key] = default
+            continue
+        if not -(2**63) <= n <= 2**63 - 1:
+            messages.append(_invalid_int_message(key, raw))
+            values[key] = default
+            continue
+        values[key] = min(n, get_settings().max_page_size) if key == "limit" else n
+    if not messages:
+        return values, None
+    return values, {
+        "ok": False,
+        "error": "invalid_arguments",
+        "response_metadata": {"messages": messages},
+    }
+
+
+def _invalid_int_message(key: str, raw: str) -> str:
+    """One refusal line, naming the parameter and the value it could not read."""
+    return f"[ERROR] invalid number: could not parse {raw!r} as a number [json-pointer:/{key}]"
+
+
+def _invalid_int(key: str, raw: str) -> HTTPException:
+    """The refusal a single unreadable numeric parameter gets, as an HTTPException."""
+    return HTTPException(
+        status_code=200,
+        detail={
+            "ok": False,
+            "error": "invalid_arguments",
+            "response_metadata": {"messages": [_invalid_int_message(key, raw)]},
+        },
+    )

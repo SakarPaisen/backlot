@@ -727,6 +727,87 @@ def test_slack_search_sort_dir_outside_the_enum_is_invalid_arguments(
         }
 
 
+@pytest.mark.parametrize(
+    "params, want",
+    [
+        # A value int() cannot read is refused, not read as the default. The fallback served a
+        # full page, which a client reads as a real page of that size.
+        ([("query", "the"), ("count", "abc")], "count"),
+        ([("query", "the"), ("count", "3abc")], "count"),
+        ([("query", "the"), ("count", "1e2")], "count"),
+        ([("query", "the"), ("count", "0x10")], "count"),
+        ([("query", "the"), ("count", "3.5")], "count"),
+        ([("query", "the"), ("page", "")], "ok"),
+        # An unreadable number answers ahead of an unknown sort_dir.
+        ([("query", "the"), ("sort_dir", "bogus"), ("count", "x")], "count"),
+        # The missing required argument still answers first of all.
+        ([("count", "x")], "missing query"),
+    ],
+)
+@pytest.mark.parametrize("method", ["search.messages", "search.all", "search.files"])
+def test_slack_search_unreadable_count_is_invalid_arguments(client, admin_h, method, params, want):
+    """A `count` that is not a number is refused, and its order against the other checks,
+    measured live: it answers before an unknown `sort_dir` and before an empty `query`,
+    naming the parameter it could not read."""
+    j = client.get(f"/slack/api/{method}", headers=admin_h, params=params).json()
+    if want == "missing query":
+        assert j == {
+            "ok": False,
+            "error": "invalid_arguments",
+            "response_metadata": {"messages": ["[ERROR] missing required field: query"]},
+        }
+        return
+    if want == "ok":
+        assert j["ok"] is True
+        return
+    assert j["ok"] is False and j["error"] == "invalid_arguments"
+    messages = j["response_metadata"]["messages"]
+    assert len(messages) == 1 and "json-pointer:/count]" in messages[0], messages
+
+
+def test_slack_search_empty_query_answers_after_an_unreadable_count(client, admin_h):
+    """An empty query is its own error on search.messages and search.all, and the number check
+    answers ahead of it; search.files answers `no_query` after it for the same request."""
+    params = [("query", ""), ("count", "x")]
+    j = client.get("/slack/api/search.messages", headers=admin_h, params=params).json()
+    assert j["error"] == "invalid_arguments", j
+    assert "json-pointer:/count]" in j["response_metadata"]["messages"][0]
+
+    j = client.get("/slack/api/search.files", headers=admin_h, params=params).json()
+    assert j["error"] == "invalid_arguments", j
+    assert "json-pointer:/count]" in j["response_metadata"]["messages"][0]
+
+
+def test_slack_search_source_names_both_unreadable_numbers_with_count_first(client, admin_h):
+    """`?count=x&page=y` names both, `/count` first, so a client fixing one field at a time is
+    not sent back for the other."""
+    j = client.get(
+        "/slack/api/search.messages",
+        headers=admin_h,
+        params=[("query", "the"), ("count", "x"), ("page", "y")],
+    ).json()
+    assert j["error"] == "invalid_arguments", j
+    messages = j["response_metadata"]["messages"]
+    assert len(messages) == 2, messages
+    assert "json-pointer:/count]" in messages[0]
+    assert "json-pointer:/page]" in messages[1]
+
+
+def test_slack_search_repeated_count_reads_the_first_value(client, admin_h):
+    """`?count=1&count=100` is the first, not the last.
+
+    A client that appends to a URL instead of replacing what is in it was served the other
+    page; the paged methods take the first value.
+    """
+    j = client.get(
+        "/slack/api/search.messages",
+        headers=admin_h,
+        params=[("query", "the"), ("count", "1"), ("count", "100")],
+    ).json()
+    assert j["ok"] is True
+    assert j["messages"]["paging"]["count"] == 1, j["messages"]["paging"]
+
+
 def test_slack_search_all(client, admin_h):
     # slack-go's Search()/SearchContext() hits search.all; it must return both messages + files.
     j = client.post("/slack/api/search.all", headers=admin_h, data={"query": "the"}).json()
