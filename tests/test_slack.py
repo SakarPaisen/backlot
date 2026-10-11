@@ -737,9 +737,13 @@ def test_slack_search_sort_dir_outside_the_enum_is_invalid_arguments(
         ([("query", "the"), ("count", "1e2")], "count"),
         ([("query", "the"), ("count", "0x10")], "count"),
         ([("query", "the"), ("count", "3.5")], "count"),
-        ([("query", "the"), ("page", "")], "ok"),
-        # An unreadable number answers ahead of an unknown sort_dir.
-        ([("query", "the"), ("sort_dir", "bogus"), ("count", "x")], "count"),
+        # An empty value is refused on the numeric parameters the method reads (issue table;
+        # real refused `count=` on search.messages and `limit=` on users.list again 2026-10-11).
+        # search.files does not read `page`, so an empty one is served there.
+        ([("query", "the"), ("page", "")], {"search.files": "ok"}),
+        # An unreadable number and an unknown `sort_dir` answer TOGETHER, in field order:
+        # `/count` then `/sort_dir`, measured on real 2026-10-11.
+        ([("query", "the"), ("sort_dir", "bogus"), ("count", "x")], "together"),
         # The missing required argument still answers first of all.
         ([("count", "x")], "missing query"),
     ],
@@ -750,6 +754,26 @@ def test_slack_search_unreadable_count_is_invalid_arguments(client, admin_h, met
     measured live: it answers before an unknown `sort_dir` and before an empty `query`,
     naming the parameter it could not read."""
     j = client.get(f"/slack/api/{method}", headers=admin_h, params=params).json()
+    if isinstance(want, dict):  # a row whose answer depends on the method
+        want = want.get(method, "empty")
+    if want == "empty":
+        # An empty value is refused on all nine numeric parameters (issue table; real refused
+        # `count=` on search.messages and `limit=` on users.list again 2026-10-11).
+        assert j == {
+            "ok": False,
+            "error": "invalid_arguments",
+            "response_metadata": {
+                "messages": ["[ERROR] must provide a number [json-pointer:/page]"]
+            },
+        }
+        return
+    if want == "together":
+        assert j["ok"] is False and j["error"] == "invalid_arguments"
+        messages = j["response_metadata"]["messages"]
+        assert len(messages) == 2, messages
+        assert messages[0] == "[ERROR] must provide a number [json-pointer:/count]"
+        assert messages[1] == "[ERROR] must be a valid enum value [json-pointer:/sort_dir]"
+        return
     if want == "missing query":
         assert j == {
             "ok": False,
@@ -793,11 +817,12 @@ def test_slack_search_source_names_both_unreadable_numbers_with_count_first(clie
     assert "json-pointer:/page]" in messages[1]
 
 
-def test_slack_search_repeated_count_reads_the_first_value(client, admin_h):
-    """`?count=1&count=100` is the first, not the last.
+def test_slack_search_repeated_count_reads_the_last_value(client, admin_h):
+    """`?count=1&count=100` is the last, as real answers (measured 2026-10-11).
 
-    A client that appends to a URL instead of replacing what is in it was served the other
-    page; the paged methods take the first value.
+    Real reads the last value: `users.list?limit=1&limit=3` served three members and
+    `?limit=3&limit=1` one. `main` does that through `_param`, and the comment on `_SORT_DIRS`
+    records the same for `sort_dir`.
     """
     j = client.get(
         "/slack/api/search.messages",
@@ -805,7 +830,7 @@ def test_slack_search_repeated_count_reads_the_first_value(client, admin_h):
         params=[("query", "the"), ("count", "1"), ("count", "100")],
     ).json()
     assert j["ok"] is True
-    assert j["messages"]["paging"]["count"] == 1, j["messages"]["paging"]
+    assert j["messages"]["paging"]["count"] == 100, j["messages"]["paging"]
 
 
 def test_slack_search_all(client, admin_h):
