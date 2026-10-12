@@ -488,27 +488,6 @@ def test_slack_rejects_an_invalid_cursor(client, admin_h, path):
         assert j == {"ok": False, "error": "invalid_cursor"}, (path, bad)
 
 
-@pytest.mark.parametrize(
-    "path, key",
-    [
-        ("conversations.list", "channels"),
-        ("users.list", "members"),
-        ("conversations.members", "members"),
-        ("conversations.history", "messages"),
-    ],
-)
-def test_slack_limit_zero_is_the_default_page(client, admin_h, path, key):
-    """The rule `_limit` records. An empty page whose cursor names itself would keep a
-    cursor-following client on that page forever."""
-    channel = path in ("conversations.members", "conversations.history")
-    params = {"channel": _a_channel_id(client, admin_h)} if channel else {}
-    unset = client.get(f"/slack/api/{path}", headers=admin_h, params=params).json()
-    assert unset[key], path
-    for zero in ("0", "00"):
-        got = client.get(f"/slack/api/{path}", headers=admin_h, params={**params, "limit": zero})
-        assert got.json() == unset, (path, zero)
-
-
 def test_slack_history_rejects_an_invalid_cursor(client, admin_h):
     j = client.get(
         "/slack/api/conversations.history",
@@ -727,110 +706,152 @@ def test_slack_search_sort_dir_outside_the_enum_is_invalid_arguments(
         }
 
 
+_UNSET = "<the argument left out>"
+_LIMIT_METHODS = [
+    "conversations.list",
+    "users.list",
+    "conversations.members",
+    "conversations.history",
+]
+_SEARCH_METHODS = ["search.messages", "search.all", "search.files"]
+_CHANNEL_ARG = {m: [("channel", _OWN_CHANNEL)] for m in _LIMIT_METHODS[2:]}
+_NUMBER_LINE = "[ERROR] must provide a number [json-pointer:/{}]".format
+_SORT_DIR_LINE = "[ERROR] must be a valid enum value [json-pointer:/sort_dir]"
+# Each value and the number real reads it as: `_UNSET` where real serves the page it serves with
+# the argument left out, None where it answers `invalid_arguments` with one line naming the field.
+# Of the four `limit` methods, users.list alone holds more than three items in the bundled corpus,
+# so it is where 1, 2 and 3 differ from the page served without `limit`.
+_LIMIT_VALUES = [
+    *((v, _UNSET) for v in ("0", "00", "-0", ".5", "0.0", "1e-1", "1e400")),
+    *((v, 2) for v in ("02", "002", "2.0", "2.9", "2e0", "2E0", "20e-1", "0.2e1", "2.5e0", "2\n")),
+    ("1.5", 1),
+    ("3.99999", 3),
+    *(
+        (v, None)
+        for v in ("abc", "", "5abc", "0x10", " 2", "2 ", "\t2", "+2", "2.", "2e+0", "1_0")
+        + ("\u0662", "\uff12", "Infinity", "NaN", "2\n\n", ".", "1e", "1.e1")
+    ),
+]
+_INTEGER_VALUES = [
+    *((v, int(v)) for v in ("0", "00", "02", "-1", "9223372036854775807", "-9223372036854775808")),
+    *(
+        (v, None)
+        for v in ("abc", "", "5abc", "0x10", " 2", "2 ", "\t2", "+2", "-0", "-00", "-01", "2\n")
+        + ("1_0", "\u0662", "\uff12", "2.0", "2.", "1.5", "1e1", "2e0", "9223372036854775808")
+        + ("-9223372036854775809",)
+    ),
+]
+_PAGE_VALUES = [
+    *((v, int(v)) for v in ("02", "00", "-1", "9223372036854775807")),
+    *((v, None) for v in ("abc", "", "5abc", "0x10", "-0", "2\n", "+2", "2.0", "1.5", "1e2")),
+    ("9223372036854775808", None),
+]
+
+
+def _number_rows():
+    for m in _LIMIT_METHODS:
+        for v, want in _LIMIT_VALUES:
+            yield (
+                m,
+                [*_CHANNEL_ARG.get(m, []), ("limit", v)],
+                [_NUMBER_LINE("limit")] if want is None else want,
+            )
+    for m in _SEARCH_METHODS:
+        for v, n in _INTEGER_VALUES:
+            yield m, [("query", "the"), ("count", v)], [_NUMBER_LINE("count")] if n is None else n
+    for m in _SEARCH_METHODS:
+        for v, n in _PAGE_VALUES:
+            yield m, [("query", "the"), ("page", v)], [_NUMBER_LINE("page")] if n is None else n
+
+
 @pytest.mark.parametrize(
-    "params, want",
+    "method, params, want",
     [
-        # A value int() cannot read is refused, not read as the default. The fallback served a
-        # full page, which a client reads as a real page of that size.
-        ([("query", "the"), ("count", "abc")], "count"),
-        ([("query", "the"), ("count", "3abc")], "count"),
-        ([("query", "the"), ("count", "1e2")], "count"),
-        ([("query", "the"), ("count", "0x10")], "count"),
-        ([("query", "the"), ("count", "3.5")], "count"),
-        # An empty value is refused on the numeric parameters the method reads (issue table;
-        # real refused `count=` on search.messages and `limit=` on users.list again 2026-10-11).
-        # search.files does not read `page`, so an empty one is served there.
-        ([("query", "the"), ("page", "")], {"search.files": "ok"}),
-        # An unreadable number and an unknown `sort_dir` answer TOGETHER, in field order:
-        # `/count` then `/sort_dir`, measured on real 2026-10-11.
-        ([("query", "the"), ("sort_dir", "bogus"), ("count", "x")], "together"),
-        # The missing required argument still answers first of all.
-        ([("count", "x")], "missing query"),
+        *_number_rows(),
+        # Real reads a repeated argument by its last value.
+        ("users.list", [("limit", "1"), ("limit", "3")], 3),
+        ("users.list", [("limit", "3"), ("limit", "1")], 1),
+        # A missing required argument answers alone...
+        ("conversations.history", [("limit", "abc")], ["[ERROR] missing required field: channel"]),
+        ("search.messages", [("count", "x")], ["[ERROR] missing required field: query"]),
+        # ...and a refused number answers ahead of the checks that follow it.
+        (
+            "conversations.history",
+            [("channel", "C_NOPE"), ("limit", "abc")],
+            [_NUMBER_LINE("limit")],
+        ),
+        (
+            "conversations.history",
+            [("channel", _OWN_CHANNEL), ("latest", "x"), ("limit", "abc")],
+            [_NUMBER_LINE("limit")],
+        ),
+        (
+            "conversations.history",
+            [("channel", _OWN_CHANNEL), ("cursor", "zzz"), ("limit", "abc")],
+            [_NUMBER_LINE("limit")],
+        ),
+        ("conversations.list", [("types", "bogus"), ("limit", "abc")], [_NUMBER_LINE("limit")]),
+        ("conversations.list", [("cursor", "zzz"), ("limit", "abc")], [_NUMBER_LINE("limit")]),
+        ("users.list", [("cursor", "zzz"), ("limit", "abc")], [_NUMBER_LINE("limit")]),
+        ("users.list", [("sort_dir", "bogus"), ("limit", "abc")], [_NUMBER_LINE("limit")]),
+        (
+            "conversations.members",
+            [("channel", "C_NOPE"), ("limit", "abc")],
+            [_NUMBER_LINE("limit")],
+        ),
+        (
+            "conversations.members",
+            [("channel", _OWN_CHANNEL), ("cursor", "zzz"), ("limit", "abc")],
+            [_NUMBER_LINE("limit")],
+        ),
+        *(
+            (m, [("query", " "), ("count", "abc")], [_NUMBER_LINE("count")])
+            for m in _SEARCH_METHODS
+        ),
+        # Every refused number and an unknown `sort_dir` share one answer, in field order.
+        *(
+            (
+                m,
+                [("query", "the"), ("count", "abc"), ("page", "xyz"), ("sort_dir", "bogus")],
+                [_NUMBER_LINE("count"), _NUMBER_LINE("page"), _SORT_DIR_LINE],
+            )
+            for m in _SEARCH_METHODS
+        ),
+        (
+            "search.messages",
+            [("sort_dir", "bogus"), ("page", "xyz"), ("count", "abc"), ("query", "the")],
+            [_NUMBER_LINE("count"), _NUMBER_LINE("page"), _SORT_DIR_LINE],
+        ),
     ],
 )
-@pytest.mark.parametrize("method", ["search.messages", "search.all", "search.files"])
-def test_slack_search_unreadable_count_is_invalid_arguments(client, admin_h, method, params, want):
-    """A `count` that is not a number is refused, and its order against the other checks,
-    measured live: it answers before an unknown `sort_dir` and before an empty `query`,
-    naming the parameter it could not read."""
-    j = client.get(f"/slack/api/{method}", headers=admin_h, params=params).json()
-    if isinstance(want, dict):  # a row whose answer depends on the method
-        want = want.get(method, "empty")
-    if want == "empty":
-        # An empty value is refused on all nine numeric parameters (issue table; real refused
-        # `count=` on search.messages and `limit=` on users.list again 2026-10-11).
-        assert j == {
+def test_slack_numeric_arguments_are_read_as_real_reads_them(client, admin_h, method, params, want):
+    """The rule on `_SLACK_INTEGER` and the order `_limit` and `_numbers` answer in, every row as
+    slack.com/api answered it. A row answered as a number is compared with the request that sends
+    that number in its place, and an `_UNSET` row with the request that leaves the argument out,
+    whose page is not empty: an empty page whose cursor names itself would keep a client that
+    follows cursors on that page forever."""
+    cid = _a_channel_id(client, admin_h)
+
+    def get(ps):
+        ps = [(k, cid if v == _OWN_CHANNEL else v) for k, v in ps]
+        r = client.get(f"/slack/api/{method}", headers=admin_h, params=ps)
+        assert r.status_code == 200
+        return r.json()
+
+    got = get(params)
+    if isinstance(want, list):
+        assert got == {
             "ok": False,
             "error": "invalid_arguments",
-            "response_metadata": {
-                "messages": ["[ERROR] must provide a number [json-pointer:/page]"]
-            },
+            "response_metadata": {"messages": want},
         }
         return
-    if want == "together":
-        assert j["ok"] is False and j["error"] == "invalid_arguments"
-        messages = j["response_metadata"]["messages"]
-        assert len(messages) == 2, messages
-        assert messages[0] == "[ERROR] must provide a number [json-pointer:/count]"
-        assert messages[1] == "[ERROR] must be a valid enum value [json-pointer:/sort_dir]"
-        return
-    if want == "missing query":
-        assert j == {
-            "ok": False,
-            "error": "invalid_arguments",
-            "response_metadata": {"messages": ["[ERROR] missing required field: query"]},
-        }
-        return
-    if want == "ok":
-        assert j["ok"] is True
-        return
-    assert j["ok"] is False and j["error"] == "invalid_arguments"
-    messages = j["response_metadata"]["messages"]
-    assert len(messages) == 1 and "json-pointer:/count]" in messages[0], messages
-
-
-def test_slack_search_empty_query_answers_after_an_unreadable_count(client, admin_h):
-    """An empty query is its own error on search.messages and search.all, and the number check
-    answers ahead of it; search.files answers `no_query` after it for the same request."""
-    params = [("query", ""), ("count", "x")]
-    j = client.get("/slack/api/search.messages", headers=admin_h, params=params).json()
-    assert j["error"] == "invalid_arguments", j
-    assert "json-pointer:/count]" in j["response_metadata"]["messages"][0]
-
-    j = client.get("/slack/api/search.files", headers=admin_h, params=params).json()
-    assert j["error"] == "invalid_arguments", j
-    assert "json-pointer:/count]" in j["response_metadata"]["messages"][0]
-
-
-def test_slack_search_source_names_both_unreadable_numbers_with_count_first(client, admin_h):
-    """`?count=x&page=y` names both, `/count` first, so a client fixing one field at a time is
-    not sent back for the other."""
-    j = client.get(
-        "/slack/api/search.messages",
-        headers=admin_h,
-        params=[("query", "the"), ("count", "x"), ("page", "y")],
-    ).json()
-    assert j["error"] == "invalid_arguments", j
-    messages = j["response_metadata"]["messages"]
-    assert len(messages) == 2, messages
-    assert "json-pointer:/count]" in messages[0]
-    assert "json-pointer:/page]" in messages[1]
-
-
-def test_slack_search_repeated_count_reads_the_last_value(client, admin_h):
-    """`?count=1&count=100` is the last, as real answers (measured 2026-10-11).
-
-    Real reads the last value: `users.list?limit=1&limit=3` served three members and
-    `?limit=3&limit=1` one. `main` does that through `_param`, and the comment on `_SORT_DIRS`
-    records the same for `sort_dir`.
-    """
-    j = client.get(
-        "/slack/api/search.messages",
-        headers=admin_h,
-        params=[("query", "the"), ("count", "1"), ("count", "100")],
-    ).json()
-    assert j["ok"] is True
-    assert j["messages"]["paging"]["count"] == 100, j["messages"]["paging"]
+    key = params[-1][0]
+    rest = [p for p in params if p[0] != key]
+    same = get(rest if want == _UNSET else [*rest, (key, str(want))])
+    assert got["ok"] is True and got == same
+    if key == "limit" and want == _UNSET:
+        assert any(v for v in same.values() if isinstance(v, list)), same
 
 
 def test_slack_search_all(client, admin_h):

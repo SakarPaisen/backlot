@@ -272,13 +272,7 @@ def attach_warning(payload: dict, warning: str) -> dict:
 # by its last value. A missing `query` is answered before this and an empty one after it. `sort`
 # has no such check, `sort=bogus` is served.
 _SORT_DIRS = {"asc", "desc"}
-_SORT_DIR_ERROR = {
-    "ok": False,
-    "error": "invalid_arguments",
-    "response_metadata": {
-        "messages": ["[ERROR] must be a valid enum value [json-pointer:/sort_dir]"]
-    },
-}
+_SORT_DIR_LINE = "[ERROR] must be a valid enum value [json-pointer:/sort_dir]"
 
 
 def _channel_core(request: Request, conn, name: str, caller: Caller) -> dict:
@@ -900,14 +894,9 @@ def _messages_block(request: Request, *, empty_sort_dir_ok: bool):
         return err, None
     if err := _missing_argument(request, "query"):
         return err, None
-    # The number lines and the `sort_dir` line answer together, in that order, and ahead of an
-    # empty `query`. Measured on real: the missing required argument above is the only thing that
-    # answers ahead of them.
     counts, err = _numbers(request, ("count", 20), ("page", 1), sort_dir_ok=empty_sort_dir_ok)
     if err is not None:
-        # A JSONResponse, not the dict: the handler's response_model would otherwise fill in the
-        # fields the refusal does not carry, which real does not send either.
-        return JSONResponse(err), None
+        return err, None
     query = _param(request, "query") or ""
     # A query that arrived with nothing in it has its own error, measured live on all three search
     # methods: blank or whitespace-only is `no_query`, where absent is `invalid_arguments` above.
@@ -984,11 +973,9 @@ async def search_files(request: Request):
         return err
     if err := _missing_argument(request, "query"):
         return err
-    # Same order as search.messages and search.all: the number lines and the `sort_dir` line
-    # answer together. search.files reads `count` alone, so there is no second number to report.
-    counts, err = _numbers(request, ("count", 20), sort_dir_ok=False)
+    counts, err = _numbers(request, ("count", 20), ("page", 1), sort_dir_ok=False)
     if err is not None:
-        return JSONResponse(err)
+        return err
     query = _param(request, "query") or ""
     if not query.strip():
         return _err("no_query")
@@ -1331,112 +1318,74 @@ def _param(request: Request, key: str) -> str | None:
     return form.get(key) if form else None
 
 
-def _limit(request: Request) -> tuple[int, JSONResponse | None]:
-    """The page size a paged method serves, and the refusal for an unreadable `limit`.
-
-    The refusal is returned rather than raised: the handler answers it before it resolves the
-    channel, `types` or cursor, which is where real answers it. A `limit` of zero is read as no
-    `limit` at all: on `conversations.list`, `users.list`, `conversations.members` and
-    `conversations.history`, `0` (measured 2026-10-03 and 2026-10-05) and `00` (2026-10-05)
-    answered what the same request without `limit` answers, every item and an empty
-    `next_cursor`, on collections of 8 to 21."""
-    default = get_settings().default_page_size
-    value, err = _int(request, "limit", default)
-    if err is not None:
-        return default, err
-    return value or default, None
+# How real reads the numbers a paged method takes, measured against slack.com/api from 2026-10-10
+# to 2026-10-12 on each method that reads them. `count` and `page` take ASCII digits, a leading
+# zero included, and a minus sign only before a digit other than zero (`-1` is read, `-0` and
+# `-01` are refused), within the signed 64-bit range. `limit` takes a decimal with an optional
+# fraction and exponent (`2.9`, `.5`, `2e0`, `20e-1`), but no `+` before it or before the
+# exponent, no `2.` and no `1.e1`, and serves its integer part. One trailing newline is read on
+# `limit` and on neither of the others. Anything else, padding, an empty value, `0x10`, `1_0` and
+# digits outside ASCII included, is refused with one line naming the field. What a negative
+# `limit` or one past 2**63 serves is outside this rule: real's answer to it differs by method.
+_SLACK_INTEGER = re.compile(r"[0-9]+|-[1-9][0-9]*")
+_SLACK_NUMBER = re.compile(r"-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE]-?[0-9]+)?\n?")
 
 
-def _int(request: Request, key: str, default: int) -> tuple[int, JSONResponse | None]:
-    """One numeric parameter, and the refusal the real API gives an unreadable one.
-
-    Anything ``int()`` cannot read is refused with `invalid_arguments` rather than falling back
-    to the default. The fallback silently served a FULL page (the default page size) for
-    `?limit=abc`, which a client reads as a real 100-item page and pages through the collection
-    differently from the real service, which refuses the request outright.
-
-    The width is a long rather than an int: Slack echoes `2147483648` back, so it is not Java's
-    int, and a value beyond the signed 64-bit range is what the refusal is for. Every numeric
-    read is capped at `max_page_size`, as on `main`, so a huge `page` or `count` cannot overflow
-    the slice arithmetic.
-    """
-    raw = _param(request, key)
-    if raw is None:
-        return default, None
-    if raw == "":
-        # An empty value is refused, as real does (issue table; `count=` and `limit=` refused on
-        # real 2026-10-11). An absent one is not this case.
-        return default, _invalid_int(key)
-    try:
-        n = int(raw)
-    except ValueError:
-        return default, _invalid_int(key)
-    if not -(2**63) <= n <= 2**63 - 1:
-        return default, _invalid_int(key)
-    return min(n, get_settings().max_page_size), None
+def _slack_number(key: str, raw: str) -> int | None:
+    """The value of one numeric argument by the rule on `_SLACK_INTEGER`, or None where real
+    refuses it. A `limit` is its integer part (`1.5` is 1, `3.99999` is 3), and one too large for a
+    float (`1e400`) is zero, which `_limit` serves as no `limit`, as real served every item."""
+    if key == "limit":
+        if not _SLACK_NUMBER.fullmatch(raw):
+            return None
+        x = float(raw)
+        return int(x) if math.isfinite(x) else 0
+    if not _SLACK_INTEGER.fullmatch(raw):
+        return None
+    n = int(raw)
+    return n if -(2**63) <= n < 2**63 else None
 
 
 def _numbers(
     request: Request, *params: tuple[str, int], sort_dir_ok: bool | None = None
-) -> tuple[dict[str, int], dict | None]:
-    """Read several numeric parameters at once, and report every unreadable one together.
+) -> tuple[dict[str, int], JSONResponse | None]:
+    """The numeric arguments `params` names as `(key, default)`, each read by `_slack_number` and
+    capped at `max_page_size`, and the `invalid_arguments` that names every one real refuses.
 
-    A request with two unreadable numbers is answered with both in `response_metadata.messages`
-    rather than only the first: measured on real, `?count=x&page=y` names `/count` and then
-    `/page`, so a client fixing one field at a time is not sent back for the other.
-
-    Real answers an unknown `sort_dir` in the SAME answer as the number lines, in the order
-    `/count`, `/page`, `/sort_dir` (search.messages with the query either way round, and
-    search.all; search.files gives `/count` then `/sort_dir`; measured 2026-10-11). `sort_dir_ok`
-    is the `empty_ok` rule on `_SORT_DIRS`: pass it and an unknown `sort_dir` joins the lines
-    instead of being a separate answer, which real contradicts with the number check first.
-    """
+    Real puts one line per refused field in one answer, in the order `params` lists them
+    whichever was sent first, and on the search methods an unknown `sort_dir` adds its line after
+    them, all of it ahead of an empty query (measured 2026-10-11 and 2026-10-12 on search.messages
+    with the query sent first or last, search.all and search.files). `sort_dir_ok` is the
+    `empty_ok` half of the rule on `_SORT_DIRS`; None leaves `sort_dir` unread."""
     values: dict[str, int] = {}
     messages: list[str] = []
     for key, default in params:
         raw = _param(request, key)
-        if raw is None:
-            values[key] = default
-            continue
-        if raw == "":
-            messages.append(_invalid_int_message(key))
-            values[key] = default
-            continue
-        try:
-            n = int(raw)
-        except ValueError:
-            messages.append(_invalid_int_message(key))
-            values[key] = default
-            continue
-        if not -(2**63) <= n <= 2**63 - 1:
-            messages.append(_invalid_int_message(key))
-            values[key] = default
-            continue
+        n = default if raw is None else _slack_number(key, raw)
+        if n is None:
+            messages.append(f"[ERROR] must provide a number [json-pointer:/{key}]")
+            n = default
         values[key] = min(n, get_settings().max_page_size)
     if sort_dir_ok is not None:
         value = _param(request, "sort_dir")
         if value is not None and value not in _SORT_DIRS and not (sort_dir_ok and value == ""):
-            messages.append(_SORT_DIR_ERROR["response_metadata"]["messages"][0])
+            messages.append(_SORT_DIR_LINE)
     if not messages:
         return values, None
-    return values, {
-        "ok": False,
-        "error": "invalid_arguments",
-        "response_metadata": {"messages": messages},
-    }
-
-
-def _invalid_int_message(key: str) -> str:
-    """One refusal line, naming the parameter. Real does not echo the value."""
-    return f"[ERROR] must provide a number [json-pointer:/{key}]"
-
-
-def _invalid_int(key: str) -> JSONResponse:
-    """The refusal a single unreadable numeric parameter gets."""
-    return JSONResponse(
-        {
-            "ok": False,
-            "error": "invalid_arguments",
-            "response_metadata": {"messages": [_invalid_int_message(key)]},
-        }
+    return values, JSONResponse(
+        {"ok": False, "error": "invalid_arguments", "response_metadata": {"messages": messages}}
     )
+
+
+def _limit(request: Request) -> tuple[int, JSONResponse | None]:
+    """The page size a paged method serves, and the refusal for a `limit` real does not read.
+
+    Each handler answers the refusal after its missing-argument check and before it resolves the
+    channel, `types`, `latest` or cursor, where real answers it (measured 2026-10-10 and
+    2026-10-11). A `limit` read as zero is read as no `limit` at all: on `conversations.list`,
+    `users.list`, `conversations.members` and `conversations.history`, `0` (measured 2026-10-03
+    and 2026-10-05) and `00` (2026-10-05) answered what the same request without `limit`
+    answers, every item and an empty `next_cursor`, on collections of 8 to 21."""
+    default = get_settings().default_page_size
+    values, err = _numbers(request, ("limit", default))
+    return values["limit"] or default, err
