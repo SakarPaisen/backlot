@@ -1332,7 +1332,7 @@ def _param(request: Request, key: str) -> str | None:
 # digits outside ASCII included, is refused with one line naming the field. What a negative
 # `limit` or one past 2**63 serves is outside this rule: real's answer to it differs by method.
 _SLACK_INTEGER = re.compile(r"[0-9]+|-[1-9][0-9]*")
-_SLACK_NUMBER = re.compile(r"-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE]-?[0-9]+)?\n?")
+_SLACK_NUMBER = re.compile(r"-?(?:[0-9]+(?:[.][0-9]+)?|[.][0-9]+)(?:[eE]-?[0-9]+)?\n?")
 
 
 def _slack_number(key: str, raw: str) -> int | None:
